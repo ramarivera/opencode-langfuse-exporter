@@ -104,6 +104,35 @@ export interface ChatParamsEvent extends BasePluginEvent {
 }
 
 /**
+ * File diff information from session.diff event.
+ */
+export interface FileDiff {
+  readonly file: string;
+  readonly additions: number;
+  readonly deletions: number;
+}
+
+/**
+ * Session diff event - captures file changes made during the session.
+ */
+export interface SessionDiffEvent extends BasePluginEvent {
+  readonly type: 'session.diff';
+  readonly messageId: string;
+  readonly diffs: readonly FileDiff[];
+}
+
+/**
+ * Chat message event - captures user message before processing.
+ * From the chat.message hook.
+ */
+export interface ChatMessageEvent extends BasePluginEvent {
+  readonly type: 'chat.message';
+  readonly messageId: string;
+  readonly model: string;
+  readonly agent: string;
+}
+
+/**
  * Union type of all events that flow through the stream.
  */
 export type PluginEvent =
@@ -111,7 +140,9 @@ export type PluginEvent =
   | MessageEvent
   | MessagePartEvent
   | ToolEvent
-  | ChatParamsEvent;
+  | ChatParamsEvent
+  | SessionDiffEvent
+  | ChatMessageEvent;
 
 /**
  * Extract the event key used for grouping and deduplication.
@@ -130,6 +161,10 @@ export function getEventKey(event: PluginEvent): string {
     case 'tool.execute.before':
     case 'tool.execute.after':
       return `${event.sessionId}:${event.toolName}:${event.timestamp}`;
+    case 'session.diff':
+      return `${event.sessionId}:diff:${event.messageId}`;
+    case 'chat.message':
+      return `${event.sessionId}:chat.message:${event.messageId}`;
     default:
       return event.sessionId;
   }

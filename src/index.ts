@@ -23,10 +23,13 @@ import { forkDaemon, initializeRuntime, runEffect, shutdown } from './effect/run
 import { EventQueue } from './effect/services/EventQueue.js';
 import { runEventProcessor } from './effect/streams/EventProcessor.js';
 import type {
+  ChatMessageEvent,
   ChatParamsEvent,
+  FileDiff,
   MessageEvent,
   MessagePartEvent,
   PluginEvent,
+  SessionDiffEvent,
   SessionEvent,
 } from './effect/streams/types.js';
 
@@ -264,6 +267,50 @@ function convertChatParamsEvent(
   };
 }
 
+/**
+ * Convert session.diff event to SessionDiffEvent.
+ */
+function convertSessionDiffEvent(
+  sessionId: string,
+  messageId: string,
+  diffs: Array<{ file: string; additions: number; deletions: number }>
+): SessionDiffEvent {
+  return {
+    type: 'session.diff',
+    eventKey: `${sessionId}:diff:${messageId}`,
+    timestamp: Date.now(),
+    sessionId,
+    messageId,
+    diffs: diffs.map(
+      (d): FileDiff => ({
+        file: d.file,
+        additions: d.additions,
+        deletions: d.deletions,
+      })
+    ),
+  };
+}
+
+/**
+ * Convert chat.message hook input to ChatMessageEvent.
+ */
+function convertChatMessageEvent(
+  sessionId: string,
+  messageId: string,
+  model: { providerID: string; modelID: string },
+  agent: string
+): ChatMessageEvent {
+  return {
+    type: 'chat.message',
+    eventKey: `${sessionId}:chat.message:${messageId}`,
+    timestamp: Date.now(),
+    sessionId,
+    messageId,
+    model: `${model.providerID}/${model.modelID}`,
+    agent,
+  };
+}
+
 // ============================================================
 // PLUGIN STATE
 // ============================================================
@@ -418,6 +465,18 @@ export const LangfuseExporterPlugin: Plugin = async () => {
               break;
             }
 
+            case 'session.diff': {
+              const { sessionID, messageID, diffs } = event.properties as {
+                sessionID: string;
+                messageID: string;
+                diffs: Array<{ file: string; additions: number; deletions: number }>;
+              };
+              if (diffs && diffs.length > 0) {
+                await queueEvent(convertSessionDiffEvent(sessionID, messageID, diffs));
+              }
+              break;
+            }
+
             // Silently ignore other events
             default:
               break;
@@ -453,6 +512,38 @@ export const LangfuseExporterPlugin: Plugin = async () => {
           await queueEvent(convertChatParamsEvent(input.sessionID, input));
         } catch (error) {
           logError(error, 'Error handling chat.params hook');
+        }
+      },
+
+      /**
+       * Capture user message metadata before processing.
+       * The chat.message hook is called when a new user message is received.
+       */
+      async 'chat.message'(
+        input: {
+          sessionID: string;
+          messageID?: string;
+          model?: {
+            providerID: string;
+            modelID: string;
+          };
+          agent?: string;
+        },
+        _output: Record<string, unknown>
+      ): Promise<void> {
+        if (!isInitialized) return;
+
+        // Skip if we don't have required data
+        if (!input.messageID || !input.model || !input.agent) {
+          return;
+        }
+
+        try {
+          await queueEvent(
+            convertChatMessageEvent(input.sessionID, input.messageID, input.model, input.agent)
+          );
+        } catch (error) {
+          logError(error, 'Error handling chat.message hook');
         }
       },
     };

@@ -19,7 +19,13 @@ import { EventQueue } from '../services/EventQueue.js';
 import { ProcessedIds } from '../services/ProcessedIds.js';
 import { SessionState } from '../services/SessionState.js';
 import { LangfuseClient } from '../services/LangfuseClient.js';
-import { getEventKey, type ModelParams, type PluginEvent, type TraceState } from './types.js';
+import {
+  getEventKey,
+  type FileDiff,
+  type ModelParams,
+  type PluginEvent,
+  type TraceState,
+} from './types.js';
 import { redactObject, redactText } from '../../lib/redaction.js';
 import { sessionToUUID } from '../../lib/session-id.js';
 
@@ -145,6 +151,23 @@ export const createEventProcessor = Effect.gen(function* () {
         );
       } else if (event.type === 'chat.params') {
         yield* handleChatParamsEvent(event.sessionId, event.params, sessionState);
+      } else if (event.type === 'session.diff') {
+        yield* handleSessionDiffEvent(
+          event.sessionId,
+          event.messageId,
+          event.diffs,
+          sessionState,
+          langfuseClient
+        );
+      } else if (event.type === 'chat.message') {
+        yield* handleChatMessageEvent(
+          event.sessionId,
+          event.messageId,
+          event.model,
+          event.agent,
+          sessionState,
+          langfuseClient
+        );
       }
     }).pipe(
       Effect.catchAllCause((cause) =>
@@ -187,6 +210,8 @@ export const createEventProcessor = Effect.gen(function* () {
    * - Session events: must be immediate so message events have session state
    * - Message events: must be immediate so message.part events have message info
    * - Chat params: must be immediate so params are stored before generation is created
+   * - Chat message: immediate to capture metadata before message processing
+   * - Session diff: immediate to attach file changes promptly
    * - Only message.part events are debounced (to consolidate streaming text)
    */
   const shouldProcessImmediately = (event: PluginEvent): boolean => {
@@ -195,7 +220,9 @@ export const createEventProcessor = Effect.gen(function* () {
       event.type === 'session.updated' ||
       event.type === 'session.delete' ||
       event.type === 'message.updated' ||
-      event.type === 'chat.params'
+      event.type === 'chat.params' ||
+      event.type === 'chat.message' ||
+      event.type === 'session.diff'
     );
   };
 
@@ -601,6 +628,96 @@ function handleToolEvent(
         })
         .pipe(Effect.catchAll(() => Effect.void));
     }
+  });
+}
+
+/**
+ * Handle session.diff event - captures file changes made during the session.
+ * Creates a span summarizing the file changes for this message.
+ */
+function handleSessionDiffEvent(
+  sessionId: string,
+  messageId: string,
+  diffs: readonly FileDiff[],
+  sessionState: SessionState,
+  langfuseClient: LangfuseClient
+): Effect.Effect<void, never, never> {
+  return Effect.gen(function* () {
+    const state = yield* sessionState.get(sessionId);
+    if (!state) {
+      yield* Effect.logWarning('No session state for session.diff', { sessionId });
+      return;
+    }
+
+    // Find the parent message observation to attach the diff span to
+    const messageInfo = state.messages.get(messageId);
+    const parentObservationId = messageInfo?.observationId;
+
+    // Calculate summary stats
+    const totalAdditions = diffs.reduce((sum, d) => sum + d.additions, 0);
+    const totalDeletions = diffs.reduce((sum, d) => sum + d.deletions, 0);
+    const filesChanged = diffs.map((d) => d.file);
+
+    yield* langfuseClient
+      .createSpan({
+        traceId: state.traceId,
+        parentObservationId,
+        name: 'file-changes',
+        metadata: {
+          files_changed: filesChanged.length,
+          total_additions: totalAdditions,
+          total_deletions: totalDeletions,
+          files: filesChanged.join(', '),
+        },
+      })
+      .pipe(Effect.catchAll(() => Effect.void));
+
+    yield* Effect.logDebug('Created file-changes span', {
+      sessionId,
+      messageId,
+      filesChanged: filesChanged.length,
+    });
+  });
+}
+
+/**
+ * Handle chat.message event - captures user message metadata before processing.
+ * This is called via the chat.message hook before the message is saved.
+ */
+function handleChatMessageEvent(
+  sessionId: string,
+  messageId: string,
+  model: string,
+  agent: string,
+  sessionState: SessionState,
+  langfuseClient: LangfuseClient
+): Effect.Effect<void, never, never> {
+  return Effect.gen(function* () {
+    const state = yield* sessionState.get(sessionId);
+    if (!state) {
+      yield* Effect.logWarning('No session state for chat.message', { sessionId });
+      return;
+    }
+
+    // Update trace with metadata about the interaction
+    yield* langfuseClient
+      .createTrace({
+        id: state.traceId,
+        sessionId,
+        name: state.title,
+        metadata: {
+          last_model: model,
+          last_agent: agent,
+        },
+      })
+      .pipe(Effect.catchAll(() => Effect.void));
+
+    yield* Effect.logDebug('Updated trace with chat.message metadata', {
+      sessionId,
+      messageId,
+      model,
+      agent,
+    });
   });
 }
 
