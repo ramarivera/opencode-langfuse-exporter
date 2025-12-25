@@ -284,11 +284,21 @@ function handleSessionEvent(
           name: applyRedaction(traceState.title) || 'OpenCode Session',
         })
         .pipe(Effect.catchAll(() => Effect.void));
-    } else if (eventType === 'session.updated' && title) {
+    } else if (eventType === 'session.updated' && title && title !== existing.title) {
+      // Update local state
       yield* sessionState.update(sessionId, (state) => ({
         ...state,
-        title: title || state.title,
+        title: title,
       }));
+
+      // Update the Langfuse trace with the new title
+      yield* langfuseClient
+        .createTrace({
+          id: traceId,
+          sessionId,
+          name: applyRedaction(title) || existing.title,
+        })
+        .pipe(Effect.catchAll(() => Effect.void));
     }
   });
 }
