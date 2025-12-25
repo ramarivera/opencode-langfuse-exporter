@@ -1,7 +1,14 @@
 /**
- * Disk-based spool for reliable event buffering.
+ * @deprecated This module is deprecated. Use audit-log.ts instead.
  *
- * Features:
+ * The spool was originally designed for retry queuing, but Effect.ts now
+ * handles retries with exponential backoff. This file is kept for backwards
+ * compatibility with existing spool files but should not be used for new code.
+ *
+ * For audit/debugging purposes, use the audit-log.ts module which provides
+ * a simpler write-behind log without retry semantics.
+ *
+ * Original features:
  * - JSONL file format for append-only writes
  * - Automatic cleanup based on age and size limits
  * - Idempotency key tracking to prevent duplicates

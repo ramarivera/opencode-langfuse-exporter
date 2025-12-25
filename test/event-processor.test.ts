@@ -12,7 +12,13 @@ import { LangfuseClient } from '../src/effect/services/LangfuseClient';
 import { ProcessedIdsLive } from '../src/effect/services/ProcessedIds';
 import { SessionState, SessionStateLive } from '../src/effect/services/SessionState';
 import { createEventProcessor } from '../src/effect/streams/EventProcessor';
-import type { MessagePartEvent, SessionEvent } from '../src/effect/streams/types';
+import type {
+  ChatMessageEvent,
+  ChatParamsEvent,
+  MessagePartEvent,
+  SessionDiffEvent,
+  SessionEvent,
+} from '../src/effect/streams/types';
 import type { LangfuseExporterConfig } from '../src/lib/config';
 
 // Mock config for testing
@@ -261,4 +267,67 @@ describe('getEventKey', () => {
     };
     expect(getEventKey(event)).toBe('session-456');
   });
+
+  it('should use composite key for session.diff events', async () => {
+    const { getEventKey } = await import('../src/effect/streams/types');
+    const event: SessionDiffEvent = {
+      type: 'session.diff',
+      eventKey: 'ignored',
+      timestamp: Date.now(),
+      sessionId: 'session-789',
+      messageId: 'msg-abc',
+      diffs: [],
+    };
+    expect(getEventKey(event)).toBe('session-789:diff:msg-abc');
+  });
+
+  it('should use composite key for chat.message events', async () => {
+    const { getEventKey } = await import('../src/effect/streams/types');
+    const event: ChatMessageEvent = {
+      type: 'chat.message',
+      eventKey: 'ignored',
+      timestamp: Date.now(),
+      sessionId: 'session-xyz',
+      messageId: 'msg-123',
+      model: 'gpt-4',
+      agent: 'default',
+    };
+    expect(getEventKey(event)).toBe('session-xyz:chat.message:msg-123');
+  });
+
+  it('should use sessionId for chat.params events (falls through to default)', async () => {
+    const { getEventKey } = await import('../src/effect/streams/types');
+    const event: ChatParamsEvent = {
+      type: 'chat.params',
+      eventKey: 'ignored',
+      timestamp: Date.now(),
+      sessionId: 'session-params',
+      params: { temperature: 0.7 },
+    };
+    // chat.params doesn't have a special case, uses sessionId (default)
+    expect(getEventKey(event)).toBe('session-params');
+  });
 });
+
+/**
+ * NOTE: TestClock-based debounce tests
+ *
+ * The EventProcessor's debounce logic uses Effect.sleep internally.
+ * For truly deterministic time-based testing, we would need to:
+ *
+ * 1. Provide TestClock to the runtime
+ * 2. Use TestClock.adjust() to advance time
+ * 3. Verify events are processed after debounce duration
+ *
+ * This is complex because:
+ * - The EventProcessor creates internal fibers with timers
+ * - These fibers need to share the same TestClock instance
+ * - The stream runs in a daemon fiber, separate from test scope
+ *
+ * Current approach: We test immediate processing (no debounce) and
+ * rely on the debounce logic being straightforward (Effect.sleep).
+ * The debounce duration constant can be verified separately.
+ *
+ * Future enhancement: Refactor EventProcessor to accept a Clock
+ * service that can be replaced with TestClock in tests.
+ */

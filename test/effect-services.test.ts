@@ -11,7 +11,14 @@ import { describe, expect, it } from 'vitest';
 import { EventQueue, EventQueueLive, EventQueueTest } from '../src/effect/services/EventQueue';
 import { ProcessedIds, ProcessedIdsLive } from '../src/effect/services/ProcessedIds';
 import { SessionState, SessionStateLive } from '../src/effect/services/SessionState';
-import type { MessageEvent, SessionEvent, TraceState } from '../src/effect/streams/types';
+import type {
+  ChatMessageEvent,
+  ChatParamsEvent,
+  MessageEvent,
+  SessionDiffEvent,
+  SessionEvent,
+  TraceState,
+} from '../src/effect/streams/types';
 
 // Helper to run Effect tests with a layer
 const runWithLayer = <A, E>(
@@ -489,5 +496,126 @@ describe('Effect Exit patterns', () => {
     if (Exit.isSuccess(exit)) {
       expect(exit.value).toBe(true);
     }
+  });
+});
+
+describe('New event type fixtures', () => {
+  // These tests verify that the new event types can be created and queued
+  const createChatParamsEvent = (sessionId: string): ChatParamsEvent => ({
+    type: 'chat.params',
+    eventKey: `${sessionId}:chat.params:${Date.now()}`,
+    timestamp: Date.now(),
+    sessionId,
+    params: {
+      temperature: 0.7,
+      topP: 1.0,
+      maxTokens: 4096,
+    },
+  });
+
+  const createSessionDiffEvent = (sessionId: string, messageId: string): SessionDiffEvent => ({
+    type: 'session.diff',
+    eventKey: `${sessionId}:diff:${messageId}`,
+    timestamp: Date.now(),
+    sessionId,
+    messageId,
+    diffs: [
+      { file: 'src/index.ts', additions: 10, deletions: 5 },
+      { file: 'test/test.ts', additions: 20, deletions: 0 },
+    ],
+  });
+
+  const createChatMessageEvent = (sessionId: string, messageId: string): ChatMessageEvent => ({
+    type: 'chat.message',
+    eventKey: `${sessionId}:chat.message:${messageId}`,
+    timestamp: Date.now(),
+    sessionId,
+    messageId,
+    model: 'anthropic/claude-3-opus',
+    agent: 'default',
+  });
+
+  it('should queue ChatParamsEvent', async () => {
+    const result = await runWithLayer(
+      Effect.gen(function* () {
+        const queue = yield* EventQueue;
+        const event = createChatParamsEvent('session-params');
+
+        yield* queue.offer(event);
+        const taken = yield* queue.take;
+
+        expect(taken.type).toBe('chat.params');
+        expect((taken as ChatParamsEvent).params.temperature).toBe(0.7);
+        return true;
+      }),
+      EventQueueLive
+    );
+    expect(result).toBe(true);
+  });
+
+  it('should queue SessionDiffEvent', async () => {
+    const result = await runWithLayer(
+      Effect.gen(function* () {
+        const queue = yield* EventQueue;
+        const event = createSessionDiffEvent('session-diff', 'msg-1');
+
+        yield* queue.offer(event);
+        const taken = yield* queue.take;
+
+        expect(taken.type).toBe('session.diff');
+        expect((taken as SessionDiffEvent).diffs).toHaveLength(2);
+        return true;
+      }),
+      EventQueueLive
+    );
+    expect(result).toBe(true);
+  });
+
+  it('should queue ChatMessageEvent', async () => {
+    const result = await runWithLayer(
+      Effect.gen(function* () {
+        const queue = yield* EventQueue;
+        const event = createChatMessageEvent('session-chat', 'msg-2');
+
+        yield* queue.offer(event);
+        const taken = yield* queue.take;
+
+        expect(taken.type).toBe('chat.message');
+        expect((taken as ChatMessageEvent).model).toBe('anthropic/claude-3-opus');
+        expect((taken as ChatMessageEvent).agent).toBe('default');
+        return true;
+      }),
+      EventQueueLive
+    );
+    expect(result).toBe(true);
+  });
+
+  it('should track pendingModelParams in session state', async () => {
+    const result = await runWithSessionState(
+      Effect.gen(function* () {
+        const sessionState = yield* SessionState;
+        const state: TraceState = {
+          traceId: 'trace-params',
+          sessionId: 'session-params',
+          title: 'Params Test',
+          createdAt: Date.now(),
+          messages: new Map(),
+          spans: new Map(),
+          pendingModelParams: {
+            temperature: 0.5,
+            topK: 40,
+          },
+        };
+
+        yield* sessionState.set('session-params', state);
+        const retrieved = yield* sessionState.get('session-params');
+
+        expect(retrieved?.pendingModelParams?.temperature).toBe(0.5);
+        expect(retrieved?.pendingModelParams?.topK).toBe(40);
+
+        return true;
+      })
+    );
+    expect(result).toBe(true);
   });
 });
