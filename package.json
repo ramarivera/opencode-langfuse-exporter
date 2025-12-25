@@ -1,6 +1,6 @@
 {
   "name": "opencode-langfuse-exporter",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Async Langfuse exporter for OpenCode sessions (no proxy)",
   "author": {
     "name": "Ramiro Rivera",
