@@ -48,11 +48,12 @@ export interface MessagePartEvent extends BasePluginEvent {
   readonly type: 'message.part.updated';
   readonly messageId: string;
   readonly partId: string;
-  readonly partType: 'text' | 'tool-invocation' | 'tool-result';
+  readonly partType: 'text' | 'tool-call';
   readonly content?: string;
   readonly toolName?: string;
   readonly toolInput?: unknown;
   readonly toolOutput?: unknown;
+  readonly toolError?: string;
 }
 
 /**
@@ -95,6 +96,18 @@ export function getEventKey(event: PluginEvent): string {
 }
 
 /**
+ * Info about a message we're tracking.
+ */
+export interface MessageInfo {
+  /** Langfuse observation ID for this message */
+  readonly observationId: string;
+  /** Role of the message sender */
+  readonly role: 'user' | 'assistant';
+  /** Model used (for assistant messages) */
+  readonly model?: string;
+}
+
+/**
  * State tracked for an active trace (session).
  */
 export interface TraceState {
@@ -106,8 +119,8 @@ export interface TraceState {
   readonly title: string;
   /** When the trace was created */
   readonly createdAt: number;
-  /** Active generation IDs (messageId -> generationId) */
-  readonly generations: Map<string, string>;
+  /** Message info (messageId -> MessageInfo) - tracks role and Langfuse observation ID */
+  readonly messages: Map<string, MessageInfo>;
   /** Active span IDs (partId/toolKey -> spanId) */
   readonly spans: Map<string, string>;
 }

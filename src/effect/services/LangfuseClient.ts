@@ -24,7 +24,9 @@ export interface TraceData {
 }
 
 export interface GenerationData {
+  id?: string;
   traceId: string;
+  parentObservationId?: string;
   name: string;
   model?: string;
   modelParameters?: Record<string, string | number | boolean | null>;
@@ -41,7 +43,9 @@ export interface GenerationData {
 }
 
 export interface SpanData {
+  id?: string;
   traceId: string;
+  parentObservationId?: string;
   name: string;
   input?: unknown;
   output?: unknown;
@@ -195,7 +199,9 @@ export const LangfuseClientLive = Layer.effect(
       createGeneration: (data) =>
         withRetry('createGeneration', () => {
           client.generation({
+            id: data.id,
             traceId: data.traceId,
+            parentObservationId: data.parentObservationId,
             name: data.name,
             model: data.model,
             modelParameters: data.modelParameters,
@@ -211,7 +217,9 @@ export const LangfuseClientLive = Layer.effect(
       createSpan: (data) =>
         withRetry('createSpan', () => {
           client.span({
+            id: data.id,
             traceId: data.traceId,
+            parentObservationId: data.parentObservationId,
             name: data.name,
             input: data.input,
             output: data.output,

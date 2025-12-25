@@ -14,26 +14,16 @@ import pino from 'pino';
 // ============================================================
 
 /**
- * Get the OpenCode data directory
- * Follows XDG conventions, falls back to ~/.opencode
+ * Base directory for plugin data (relative to cwd where OpenCode runs).
+ * Uses .opencode/langfuse-exporter to avoid polluting the project root.
  */
-function getOpenCodeDataDir(): string {
-  const xdgData = process.env.XDG_DATA_HOME;
-  const home = process.env.HOME || process.env.USERPROFILE || '/tmp';
-
-  if (xdgData) {
-    return join(xdgData, 'opencode');
-  }
-
-  return join(home, '.opencode');
-}
+const PLUGIN_BASE_DIR = '.opencode/langfuse-exporter';
 
 /**
- * Get the log directory for this plugin
+ * Get the log directory for this plugin (relative path).
  */
 function getLogDir(): string {
-  const opencodeDir = getOpenCodeDataDir();
-  return join(opencodeDir, 'langfuse-exporter', 'logs');
+  return join(PLUGIN_BASE_DIR, 'logs');
 }
 
 /**
@@ -65,26 +55,20 @@ ensureLogDir(logDir);
 
 const logFilePath = join(logDir, getLogFilename());
 
-// Create transports - file always, pretty console only in verbose mode
-const transport = pino.transport({
-  targets: [
-    {
-      target: 'pino/file',
-      options: { destination: logFilePath },
-      level: 'trace',
-    },
-  ],
-});
-
 /**
- * The main logger instance for the plugin
+ * The main logger instance for the plugin.
+ * Uses pino.destination for reliable async file writing.
  */
 export const logger = pino(
   {
     name: 'langfuse-exporter',
-    level: 'info', // Default level, can be changed via setLogLevel
+    level: 'debug', // Default to debug for now
+    timestamp: pino.stdTimeFunctions.isoTime,
   },
-  transport
+  pino.destination({
+    dest: logFilePath,
+    sync: false, // Async writes for better performance
+  })
 );
 
 /**

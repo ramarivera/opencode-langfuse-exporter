@@ -27,7 +27,6 @@ import type {
   MessagePartEvent,
   PluginEvent,
   SessionEvent,
-  ToolEvent,
 } from './effect/streams/types.js';
 
 // ============================================================
@@ -166,9 +165,15 @@ function convertMessagePartEvent(part: Part): MessagePartEvent | null {
   if (part.type === 'text') {
     const textPart = part as TextPart;
 
-    // Only process completed text parts
-    if (!textPart.time?.end || !textPart.text) {
+    // Skip if no text content
+    if (!textPart.text) {
       return null;
+    }
+
+    // For streaming text (has time.start), only process when complete (has time.end)
+    // User messages don't have time at all, so we process them immediately
+    if (textPart.time?.start && !textPart.time?.end) {
+      return null; // Still streaming, skip
     }
 
     return {
@@ -198,35 +203,19 @@ function convertMessagePartEvent(part: Part): MessagePartEvent | null {
       sessionId: toolPart.sessionID,
       messageId: toolPart.messageID,
       partId: toolPart.id,
-      partType: toolPart.state.status === 'error' ? 'tool-result' : 'tool-invocation',
+      partType: 'tool-call' as const,
       toolName: toolPart.tool,
       toolInput: toolPart.state.input,
       toolOutput: toolPart.state.output,
+      toolError: toolPart.state.status === 'error' ? toolPart.state.error : undefined,
     };
   }
 
   return null;
 }
 
-function convertToolEvent(
-  eventType: 'tool.execute.before' | 'tool.execute.after',
-  tool: string,
-  sessionId: string,
-  input?: unknown,
-  output?: unknown,
-  error?: string
-): ToolEvent {
-  return {
-    type: eventType,
-    eventKey: `${sessionId}:${tool}:${Date.now()}`,
-    timestamp: Date.now(),
-    sessionId,
-    toolName: tool,
-    toolInput: input,
-    toolOutput: output,
-    error,
-  };
-}
+// NOTE: convertToolEvent removed - tool.execute hooks not used anymore
+// We get complete tool data from message.part.updated events
 
 // ============================================================
 // PLUGIN STATE
@@ -391,34 +380,8 @@ export const LangfuseExporterPlugin: Plugin = async () => {
         }
       },
 
-      // Tool execution hooks for more precise timing
-      async 'tool.execute.before'(
-        input: { tool: string; sessionID: string; callID: string },
-        _output: { args: unknown }
-      ): Promise<void> {
-        if (!isInitialized) return;
-
-        await queueEvent(
-          convertToolEvent('tool.execute.before', input.tool, input.sessionID, _output.args)
-        );
-      },
-
-      async 'tool.execute.after'(
-        input: { tool: string; sessionID: string; callID: string },
-        output: { title: string; output: string; metadata: unknown }
-      ): Promise<void> {
-        if (!isInitialized) return;
-
-        await queueEvent(
-          convertToolEvent(
-            'tool.execute.after',
-            input.tool,
-            input.sessionID,
-            undefined,
-            output.output
-          )
-        );
-      },
+      // NOTE: tool.execute.before/after hooks removed - we get complete tool data
+      // from message.part.updated events which include both input AND output
     };
   } catch (error) {
     logError(error, 'Fatal error initializing plugin');

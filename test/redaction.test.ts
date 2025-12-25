@@ -156,10 +156,7 @@ describe('redactObject', () => {
   it('should handle mixed nested structures', () => {
     const obj = {
       level1: {
-        array: [
-          { key: 'AKIAIOSFODNN7EXAMPLE' },
-          { key: 'safe-value' },
-        ],
+        array: [{ key: 'AKIAIOSFODNN7EXAMPLE' }, { key: 'safe-value' }],
       },
     };
     const result = redactObject(obj, []);

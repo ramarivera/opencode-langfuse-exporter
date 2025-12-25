@@ -5,7 +5,7 @@
  * the codebase while getting Pino's structured JSON logging to file.
  */
 
-import { Effect, Layer, Logger, type LogLevel } from 'effect';
+import { Effect, Layer, Logger, LogLevel } from 'effect';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -106,10 +106,22 @@ const createPinoLogger = Effect.sync(() => {
 });
 
 /**
- * Live layer that replaces the default Effect Logger with Pino.
+ * Live layer that replaces the default Effect Logger with our file-only Pino logger.
+ *
+ * Replaces the default console logger with Logger.none first, then adds our file logger.
+ * This ensures nothing ever leaks to console.
  */
 export const PinoLoggerLive = Layer.unwrapEffect(
-  createPinoLogger.pipe(Effect.map((logger) => Logger.replace(Logger.defaultLogger, logger)))
+  createPinoLogger.pipe(
+    Effect.map((pinoLogger) =>
+      Layer.mergeAll(
+        // Kill the default console logger
+        Logger.replace(Logger.defaultLogger, Logger.none),
+        // Add our file-only logger
+        Logger.add(pinoLogger)
+      )
+    )
+  )
 );
 
 /**

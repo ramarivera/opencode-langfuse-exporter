@@ -92,7 +92,11 @@ describe('session-id', () => {
 
     it('should produce keys of consistent length', () => {
       const key1 = generateIdempotencyKey('short', 'trace', 'id');
-      const key2 = generateIdempotencyKey('a-very-long-session-id-that-is-much-longer', 'trace', 'id');
+      const key2 = generateIdempotencyKey(
+        'a-very-long-session-id-that-is-much-longer',
+        'trace',
+        'id'
+      );
 
       expect(key1.length).toBe(key2.length);
       expect(key1.length).toBe(16); // Expected length from padStart(16, '0')

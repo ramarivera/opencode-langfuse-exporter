@@ -106,23 +106,25 @@ export const createEventProcessor = Effect.gen(function* () {
       } else if (event.type === 'message.updated') {
         yield* handleMessageEvent(
           event.sessionId,
+          event.messageId,
           event.role,
-          event.content,
           event.model,
           event.usage,
           sessionState,
-          langfuseClient,
-          applyRedaction
+          langfuseClient
         );
       } else if (event.type === 'message.part.updated') {
         yield* handleMessagePartEvent(
           event.sessionId,
+          event.messageId,
           event.partType,
+          event.content,
           event.toolName,
           event.toolInput,
           event.toolOutput,
           sessionState,
           langfuseClient,
+          applyRedaction,
           applyObjectRedaction
         );
       } else if (event.type === 'tool.execute.before' || event.type === 'tool.execute.after') {
@@ -175,10 +177,33 @@ export const createEventProcessor = Effect.gen(function* () {
     });
 
   /**
+   * Check if an event should be processed immediately (no debounce).
+   *
+   * - Session events: must be immediate so message events have session state
+   * - Message events: must be immediate so message.part events have message info
+   * - Only message.part events are debounced (to consolidate streaming text)
+   */
+  const shouldProcessImmediately = (event: PluginEvent): boolean => {
+    return (
+      event.type === 'session.created' ||
+      event.type === 'session.updated' ||
+      event.type === 'session.delete' ||
+      event.type === 'message.updated'
+    );
+  };
+
+  /**
    * Handle an incoming event - update state and reset debounce timer.
+   * Session events are processed immediately without debounce.
    */
   const handleIncomingEvent = (event: PluginEvent): Effect.Effect<void, never, never> =>
     Effect.gen(function* () {
+      // Session events must be processed immediately
+      if (shouldProcessImmediately(event)) {
+        yield* processEvent(event);
+        return;
+      }
+
       const eventKey = getEventKey(event);
 
       // Get current state
@@ -238,7 +263,7 @@ function handleSessionEvent(
         sessionId,
         title: title || 'OpenCode Session',
         createdAt: Date.now(),
-        generations: new Map(),
+        messages: new Map(),
         spans: new Map(),
       };
       yield* sessionState.set(sessionId, traceState);
@@ -275,39 +300,52 @@ function handleSessionDelete(
 
 /**
  * Handle message.updated events.
+ *
+ * This registers the message in our state (for later part lookups) and creates
+ * the appropriate Langfuse observation (span for user, generation for assistant).
+ * The actual content comes from message.part.updated events.
  */
 function handleMessageEvent(
   sessionId: string,
+  messageId: string,
   role: 'user' | 'assistant',
-  content: string | undefined,
   model: string | undefined,
   usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | undefined,
   sessionState: SessionState,
-  langfuseClient: LangfuseClient,
-  applyRedaction: (s: string | undefined) => string | undefined
+  langfuseClient: LangfuseClient
 ): Effect.Effect<void, never, never> {
   return Effect.gen(function* () {
     const state = yield* sessionState.get(sessionId);
     if (!state) {
-      yield* Effect.logWarning('No session state for message', { sessionId });
+      yield* Effect.logWarning('No session state for message', { sessionId, messageId });
       return;
     }
 
+    // Check if we already have this message registered
+    if (state.messages.has(messageId)) {
+      // Already registered, nothing to do
+      return;
+    }
+
+    // Generate a unique observation ID for this message
+    const observationId = `${messageId}-${Date.now()}`;
+
+    // Create the appropriate Langfuse observation
     if (role === 'user') {
       yield* langfuseClient
         .createSpan({
+          id: observationId,
           traceId: state.traceId,
           name: 'user-message',
-          input: applyRedaction(content),
         })
         .pipe(Effect.catchAll(() => Effect.void));
     } else {
       yield* langfuseClient
         .createGeneration({
+          id: observationId,
           traceId: state.traceId,
           name: 'assistant-response',
           model,
-          output: applyRedaction(content),
           usage: usage
             ? {
                 input: usage.promptTokens,
@@ -318,50 +356,87 @@ function handleMessageEvent(
         })
         .pipe(Effect.catchAll(() => Effect.void));
     }
+
+    // Register message in state for later part lookups
+    const newMessages = new Map(state.messages);
+    newMessages.set(messageId, { observationId, role, model });
+    yield* sessionState.update(sessionId, (s) => ({
+      ...s,
+      messages: newMessages,
+    }));
   });
 }
 
 /**
  * Handle message.part.updated events.
+ *
+ * Uses the messageId to look up the parent observation and attach content appropriately:
+ * - For user messages: update the span's input with the text
+ * - For assistant messages: update the generation's output with the text
+ * - For tool calls: create child spans under the parent message
  */
 function handleMessagePartEvent(
   sessionId: string,
-  partType: 'text' | 'tool-invocation' | 'tool-result',
+  messageId: string,
+  partType: 'text' | 'tool-call',
+  textContent: string | undefined,
   toolName: string | undefined,
   toolInput: unknown,
   toolOutput: unknown,
   sessionState: SessionState,
   langfuseClient: LangfuseClient,
+  applyRedaction: (s: string | undefined) => string | undefined,
   applyObjectRedaction: <T>(obj: T) => T
 ): Effect.Effect<void, never, never> {
   return Effect.gen(function* () {
     const state = yield* sessionState.get(sessionId);
     if (!state) {
-      yield* Effect.logWarning('No session state for message part', { sessionId });
+      yield* Effect.logWarning('No session state for message part', { sessionId, messageId });
       return;
     }
 
-    if (partType === 'text') {
-      // Text parts are captured via message.updated
+    // Look up the parent message
+    const messageInfo = state.messages.get(messageId);
+    if (!messageInfo) {
+      yield* Effect.logWarning('No message info for part', { sessionId, messageId, partType });
       return;
     }
 
-    if (partType === 'tool-invocation') {
+    if (partType === 'text' && textContent) {
+      // Text content - update the parent observation
+      if (messageInfo.role === 'user') {
+        // Update user span with input text
+        yield* langfuseClient
+          .createSpan({
+            id: messageInfo.observationId,
+            traceId: state.traceId,
+            name: 'user-message',
+            input: applyRedaction(textContent),
+          })
+          .pipe(Effect.catchAll(() => Effect.void));
+      } else {
+        // Update assistant generation with output text
+        yield* langfuseClient
+          .createGeneration({
+            id: messageInfo.observationId,
+            traceId: state.traceId,
+            name: 'assistant-response',
+            output: applyRedaction(textContent),
+          })
+          .pipe(Effect.catchAll(() => Effect.void));
+      }
+      return;
+    }
+
+    if (partType === 'tool-call') {
+      // Tool calls arrive with both input and output when completed
       yield* langfuseClient
         .createSpan({
           traceId: state.traceId,
+          parentObservationId: messageInfo.observationId,
           name: `tool-${toolName || 'unknown'}`,
           input: applyObjectRedaction(toolInput),
-          startTime: new Date(),
-        })
-        .pipe(Effect.catchAll(() => Effect.void));
-    } else if (partType === 'tool-result') {
-      yield* langfuseClient
-        .createSpan({
-          traceId: state.traceId,
-          name: `tool-${toolName || 'unknown'}-result`,
           output: applyObjectRedaction(toolOutput),
-          endTime: new Date(),
         })
         .pipe(Effect.catchAll(() => Effect.void));
     }

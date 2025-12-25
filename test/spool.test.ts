@@ -42,12 +42,10 @@ function createTestConfig(spoolDir: string): LangfuseExporterConfig {
 
 describe('createSpooledEvent', () => {
   it('should create a valid spooled event with all required fields', () => {
-    const event = createSpooledEvent(
-      'trace',
-      'session-123',
-      'idem-key-abc',
-      { name: 'test-trace', sessionId: 'sess-1' }
-    );
+    const event = createSpooledEvent('trace', 'session-123', 'idem-key-abc', {
+      name: 'test-trace',
+      sessionId: 'sess-1',
+    });
 
     expect(event.type).toBe('trace');
     expect(event.sessionId).toBe('session-123');
@@ -113,12 +111,7 @@ describe('spool file operations', () => {
     it('should write events and load them back', async () => {
       await initSpool(config);
 
-      const event = createSpooledEvent(
-        'trace',
-        'session-abc',
-        'idem-123',
-        { name: 'my-trace' }
-      );
+      const event = createSpooledEvent('trace', 'session-abc', 'idem-123', { name: 'my-trace' });
 
       await writeToSpool(event, config);
 
@@ -222,7 +215,7 @@ describe('spool file operations', () => {
       // Note: This test relies on file mtime which may not work as expected
       // For more reliable testing, we'd need to mock Date or fs.stat
       const files = await readdir(testSpoolDir);
-      
+
       // Just verify cleanup doesn't throw
       expect(Array.isArray(files)).toBe(true);
     });

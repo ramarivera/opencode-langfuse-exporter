@@ -18,18 +18,21 @@ import type { LangfuseApiError } from './errors.js';
  * Combined layer with all services required by the plugin.
  *
  * Layer dependency graph:
- *   PinoLoggerLive (no deps)
+ *   PinoLoggerLive (no deps) - MUST be first to silence console
  *   EventQueueLive (no deps)
  *   SessionStateLive (no deps)
  *   ProcessedIdsLive (no deps)
- *   LangfuseClientLive (depends on PinoLoggerLive)
+ *   LangfuseClientLive (logs during init)
+ *
+ * We use Layer.provide to ensure PinoLoggerLive is fully active
+ * before LangfuseClientLive runs (which logs during construction).
  */
 export const PluginLive = Layer.mergeAll(
-  PinoLoggerLive,
   EventQueueLive,
   SessionStateLive,
-  ProcessedIdsLive
-).pipe(Layer.provideMerge(LangfuseClientLive));
+  ProcessedIdsLive,
+  LangfuseClientLive
+).pipe(Layer.provide(PinoLoggerLive));
 
 /**
  * Type of the full plugin context (all services).

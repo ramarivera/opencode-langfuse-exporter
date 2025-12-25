@@ -125,21 +125,20 @@ Each OpenCode session maps to Langfuse as follows:
 
 ## Logging
 
-The plugin logs to files in `~/.opencode/langfuse-exporter/logs/`:
+The plugin logs to files in `.opencode/langfuse-exporter/logs/` (relative to your project directory):
 
 ```
-langfuse-exporter-2024-12-25.log
-langfuse-exporter-2024-12-26.log
+.opencode/langfuse-exporter/logs/langfuse-exporter-2024-12-25.log
 ```
 
 Logs use [Pino](https://getpino.io/) in JSON format for easy parsing:
 
 ```bash
 # View today's logs
-cat ~/.opencode/langfuse-exporter/logs/langfuse-exporter-$(date +%Y-%m-%d).log | jq
+cat .opencode/langfuse-exporter/logs/langfuse-exporter-$(date +%Y-%m-%d).log | jq
 
 # Stream logs in real-time
-tail -f ~/.opencode/langfuse-exporter/logs/*.log | jq
+tail -f .opencode/langfuse-exporter/logs/*.log | jq
 ```
 
 ## Troubleshooting
@@ -147,7 +146,7 @@ tail -f ~/.opencode/langfuse-exporter/logs/*.log | jq
 ### Traces Not Appearing in Langfuse
 
 1. **Check credentials**: Ensure `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set
-2. **Check logs**: Look for errors in `~/.opencode/langfuse-exporter/logs/`
+2. **Check logs**: Look for errors in `.opencode/langfuse-exporter/logs/`
 3. **Verify host**: If self-hosting, confirm `LANGFUSE_HOST` is correct
 4. **Check export mode**: Ensure `OPENCODE_LANGFUSE_EXPORT_MODE` is not `off`
 
@@ -212,9 +211,16 @@ Contributions welcome! Please file issues or submit PRs on GitHub.
 
 MIT License. See [LICENSE](LICENSE) for details.
 
+## Status
+
+⚠️ **Early Development** - This plugin is functional but still evolving. Current limitations:
+
+- System prompt capture requires an [upstream OpenCode change](https://github.com/sst/opencode/issues/6142)
+- Some streaming edge cases may not be fully handled
+
 ## Author
 
-Ramiro Rivera <ramarivera@example.com>
+Ramiro Rivera
 
 ## Links
 
