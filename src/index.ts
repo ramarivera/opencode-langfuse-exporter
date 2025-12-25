@@ -20,6 +20,9 @@ import { Effect, Fiber } from 'effect';
 import { getInvalidPatterns, loadConfig, validateConfig } from './lib/config.js';
 import { logError, logInfo, logWarn } from './lib/logger.js';
 import { initializeRuntime, runEffect, shutdown } from './effect/runtime.js';
+
+// Note: initializeRuntime must be run with Effect.runPromise directly,
+// not via runEffect, because runEffect requires the runtime to exist first.
 import { EventQueue } from './effect/services/EventQueue.js';
 import { forkEventProcessor } from './effect/streams/EventProcessor.js';
 import type {
@@ -270,8 +273,10 @@ export const LangfuseExporterPlugin: Plugin = async () => {
     }
 
     // Initialize Effect runtime
+    // Note: Must use Effect.runPromise directly here, not runEffect,
+    // because runEffect requires the runtime to exist first (chicken-and-egg).
     try {
-      await runEffect(initializeRuntime);
+      await Effect.runPromise(initializeRuntime);
       isInitialized = true;
       logInfo('Effect runtime initialized');
 
