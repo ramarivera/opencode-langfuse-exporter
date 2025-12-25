@@ -101,36 +101,73 @@ export const LangfuseClient = Context.GenericTag<LangfuseClient>('LangfuseClient
 
 /**
  * Retry schedule for Langfuse API calls.
- * Exponential backoff with jitter, max 5 attempts.
+ * Exponential backoff with jitter, capped at max delay, limited to N attempts.
+ *
+ * Pattern: exponential(base) -> jittered -> capped -> limited
  */
 const retrySchedule = Schedule.exponential(RETRY_BASE_DELAY).pipe(
   Schedule.jittered,
-  Schedule.either(Schedule.spaced(RETRY_MAX_DELAY)),
-  Schedule.compose(Schedule.recurs(MAX_RETRY_ATTEMPTS))
+  Schedule.intersect(Schedule.spaced(RETRY_MAX_DELAY)), // Cap max delay
+  Schedule.upTo(MAX_RETRY_ATTEMPTS) // Limit total attempts
 );
 
+type LangfuseOperation = 'createTrace' | 'createGeneration' | 'createSpan' | 'flush' | 'shutdown';
+
 /**
- * Wrap a Langfuse SDK call with retry logic.
+ * Create a LangfuseApiError from an unknown error.
  */
-function withRetry<A>(
-  operation: 'createTrace' | 'createGeneration' | 'createSpan' | 'flush' | 'shutdown',
+function toLangfuseError(error: unknown, operation: LangfuseOperation): LangfuseApiError {
+  return new LangfuseApiError({
+    message: error instanceof Error ? error.message : String(error),
+    operation,
+    cause: error,
+    retryable: true,
+  });
+}
+
+/**
+ * Wrap a synchronous Langfuse SDK call with retry logic.
+ * Use this for operations that don't return a Promise (trace, generation, span creation).
+ */
+function withRetrySync<A>(
+  operation: LangfuseOperation,
   fn: () => A
 ): Effect.Effect<A, LangfuseApiError> {
   return Effect.try({
     try: fn,
-    catch: (error) =>
-      new LangfuseApiError({
-        message: error instanceof Error ? error.message : String(error),
-        operation,
-        cause: error,
-        retryable: true,
-      }),
+    catch: (error) => toLangfuseError(error, operation),
   }).pipe(
     Effect.retry(retrySchedule),
     Effect.catchAll((error) =>
       Effect.gen(function* () {
-        yield* Effect.logError(`Langfuse ${operation} failed after ${MAX_RETRY_ATTEMPTS} retries`, {
+        yield* Effect.logError(`Langfuse ${operation} failed after retries`, {
           error: error.message,
+          operation,
+        });
+        return yield* Effect.fail(error);
+      })
+    )
+  );
+}
+
+/**
+ * Wrap an asynchronous Langfuse SDK call with retry logic.
+ * Use this for operations that return a Promise (flush, shutdown).
+ */
+function withRetryAsync<A>(
+  operation: LangfuseOperation,
+  fn: () => Promise<A>
+): Effect.Effect<A, LangfuseApiError> {
+  return Effect.tryPromise({
+    try: fn,
+    catch: (error) => toLangfuseError(error, operation),
+  }).pipe(
+    Effect.retry(retrySchedule),
+    Effect.catchAll((error) =>
+      Effect.gen(function* () {
+        yield* Effect.logError(`Langfuse ${operation} failed after retries`, {
+          error: error.message,
+          operation,
         });
         return yield* Effect.fail(error);
       })
@@ -183,7 +220,7 @@ export const LangfuseClientLive = Layer.effect(
 
     return LangfuseClient.of({
       createTrace: (data) =>
-        withRetry('createTrace', () => {
+        withRetrySync('createTrace', () => {
           client.trace({
             id: data.id,
             sessionId: data.sessionId,
@@ -197,7 +234,7 @@ export const LangfuseClientLive = Layer.effect(
         }).pipe(Effect.tap(() => Effect.logDebug('Trace created', { name: data.name }))),
 
       createGeneration: (data) =>
-        withRetry('createGeneration', () => {
+        withRetrySync('createGeneration', () => {
           client.generation({
             id: data.id,
             traceId: data.traceId,
@@ -215,7 +252,7 @@ export const LangfuseClientLive = Layer.effect(
         }).pipe(Effect.tap(() => Effect.logDebug('Generation created', { name: data.name }))),
 
       createSpan: (data) =>
-        withRetry('createSpan', () => {
+        withRetrySync('createSpan', () => {
           client.span({
             id: data.id,
             traceId: data.traceId,
@@ -229,15 +266,13 @@ export const LangfuseClientLive = Layer.effect(
           });
         }).pipe(Effect.tap(() => Effect.logDebug('Span created', { name: data.name }))),
 
-      flush: withRetry('flush', () => {
-        client.flushAsync();
-      }),
+      flush: withRetryAsync('flush', () => client.flushAsync()).pipe(
+        Effect.tap(() => Effect.logDebug('Flush completed'))
+      ),
 
-      shutdown: Effect.gen(function* () {
-        yield* Effect.logInfo('Shutting down Langfuse client...');
-        yield* Effect.promise(() => client.shutdownAsync());
-        yield* Effect.logInfo('Langfuse client shutdown complete');
-      }),
+      shutdown: withRetryAsync('shutdown', () => client.shutdownAsync()).pipe(
+        Effect.tap(() => Effect.logInfo('Langfuse client shutdown complete'))
+      ),
 
       isConnected: Effect.succeed(true),
 

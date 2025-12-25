@@ -226,16 +226,22 @@ export const createEventProcessor = Effect.gen(function* () {
     });
 
   /**
+   * Log when an event is received from the queue.
+   */
+  const logEventReceived = (event: PluginEvent): Effect.Effect<void, never, never> =>
+    Effect.logDebug('Event received', {
+      type: event.type,
+      eventKey: getEventKey(event),
+    });
+
+  /**
    * Create a stream that consumes from the queue and processes events.
+   *
+   * Pipeline: Queue -> Log -> Handle (with debounce for non-immediate events)
    */
   const processingStream = Stream.fromQueue(eventQueue.queue).pipe(
-    Stream.tap((event) =>
-      Effect.logDebug('Event received', {
-        type: event.type,
-        eventKey: getEventKey(event),
-      })
-    ),
-    Stream.mapEffect((event) => handleIncomingEvent(event))
+    Stream.tap(logEventReceived),
+    Stream.mapEffect(handleIncomingEvent)
   );
 
   return processingStream;

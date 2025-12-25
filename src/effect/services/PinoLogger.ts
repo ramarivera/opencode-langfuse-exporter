@@ -3,9 +3,11 @@
  *
  * This allows using Effect.log(), Effect.logDebug(), etc. throughout
  * the codebase while getting Pino's structured JSON logging to file.
+ *
+ * Uses Effect's resource management for proper cleanup on shutdown.
  */
 
-import { Effect, Layer, Logger, LogLevel } from 'effect';
+import { Effect, Layer, Logger, LogLevel, Scope } from 'effect';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -55,36 +57,56 @@ function toPinoLevel(level: LogLevel.LogLevel): string {
 }
 
 /**
- * Simple JSON logger that writes to file (Pino-compatible format).
- * We use a simple implementation to avoid adding pino as a dependency.
+ * File logger interface.
  */
-function createFileLogger(logPath: string) {
-  const expanded = expandPath(logPath);
-  const stream = fs.createWriteStream(expanded, { flags: 'a' });
-
-  return {
-    log: (level: string, message: string, context?: Record<string, unknown>) => {
-      const entry = {
-        level,
-        time: Date.now(),
-        msg: message,
-        ...context,
-      };
-      stream.write(`${JSON.stringify(entry)}\n`);
-    },
-    close: () => {
-      stream.end();
-    },
-  };
+interface FileLogger {
+  readonly log: (level: string, message: string, context?: Record<string, unknown>) => void;
+  readonly close: () => void;
 }
 
 /**
- * Create the Pino-backed Effect Logger.
+ * Create a file logger as a scoped resource.
+ * The stream is automatically closed when the scope is closed.
+ *
+ * This follows the Effect best practice of using acquireRelease
+ * for resources that need cleanup.
  */
-const createPinoLogger = Effect.sync(() => {
+const acquireFileLogger = (logPath: string): Effect.Effect<FileLogger, never, Scope.Scope> =>
+  Effect.acquireRelease(
+    // Acquire: create the file stream
+    Effect.sync(() => {
+      const expanded = expandPath(logPath);
+      const stream = fs.createWriteStream(expanded, { flags: 'a' });
+
+      return {
+        log: (level: string, message: string, context?: Record<string, unknown>) => {
+          const entry = {
+            level,
+            time: Date.now(),
+            msg: message,
+            ...context,
+          };
+          stream.write(`${JSON.stringify(entry)}\n`);
+        },
+        close: () => {
+          stream.end();
+        },
+      };
+    }),
+    // Release: close the stream
+    (fileLogger) => Effect.sync(() => fileLogger.close())
+  );
+
+/**
+ * Create the Pino-backed Effect Logger with proper resource management.
+ *
+ * The file logger is acquired as a scoped resource, ensuring it gets
+ * cleaned up when the layer is disposed.
+ */
+const createPinoLoggerScoped = Effect.gen(function* () {
   ensureLogDir(LOG_DIR);
   const logPath = path.join(expandPath(LOG_DIR), LOG_FILE);
-  const fileLogger = createFileLogger(logPath);
+  const fileLogger = yield* acquireFileLogger(logPath);
 
   return Logger.make<unknown, void>(({ logLevel, message, annotations, date, fiberId }) => {
     const level = toPinoLevel(logLevel);
@@ -108,11 +130,14 @@ const createPinoLogger = Effect.sync(() => {
 /**
  * Live layer that replaces the default Effect Logger with our file-only Pino logger.
  *
- * Replaces the default console logger with Logger.none first, then adds our file logger.
- * This ensures nothing ever leaks to console.
+ * Uses Layer.scoped to properly manage the file stream lifecycle:
+ * - Stream is opened when the layer is built
+ * - Stream is closed when the layer/runtime is disposed
+ *
+ * This ensures nothing ever leaks to console and file handles are properly cleaned up.
  */
-export const PinoLoggerLive = Layer.unwrapEffect(
-  createPinoLogger.pipe(
+export const PinoLoggerLive = Layer.unwrapScoped(
+  createPinoLoggerScoped.pipe(
     Effect.map((pinoLogger) =>
       Layer.mergeAll(
         // Kill the default console logger

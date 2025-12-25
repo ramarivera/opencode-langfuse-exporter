@@ -103,7 +103,8 @@ describe('spool file operations', () => {
 
     it('should not throw if directory already exists', async () => {
       await mkdir(testSpoolDir, { recursive: true });
-      await expect(initSpool(config)).resolves.not.toThrow();
+      // If initSpool doesn't throw, the test passes
+      await initSpool(config);
     });
   });
 
@@ -222,12 +223,14 @@ describe('spool file operations', () => {
 
     it('should not throw when spool directory is empty', async () => {
       await initSpool(config);
-      await expect(cleanupSpool(config)).resolves.not.toThrow();
+      // If cleanupSpool doesn't throw, the test passes
+      await cleanupSpool(config);
     });
 
     it('should not throw when spool directory does not exist', async () => {
       const missingDirConfig = createTestConfig('/nonexistent/path/spool');
-      await expect(cleanupSpool(missingDirConfig)).resolves.not.toThrow();
+      // If cleanupSpool doesn't throw, the test passes
+      await cleanupSpool(missingDirConfig);
     });
   });
 
