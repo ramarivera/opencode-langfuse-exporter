@@ -1,144 +1,422 @@
 /**
- * OpenCode Plugin Template
+ * OpenCode Langfuse Exporter Plugin
  *
- * This is an example plugin that demonstrates the plugin capabilities:
- * - Custom tools (tools callable by the LLM)
- * - Custom slash commands (user-invokable /commands loaded from .md files)
- * - Config hooks (modify config at runtime)
+ * Exports OpenCode session transcripts and telemetry data to Langfuse asynchronously.
+ * This is an exporter-only plugin - LLM provider calls stay direct (no proxy routing).
  *
- * Replace this with your own plugin implementation.
+ * Features:
+ * - Effect.ts-based streaming with debounce for proper event consolidation
+ * - Never throws uncaught exceptions
+ * - Logs to ~/.opencode/langfuse-exporter/logs/
+ * - Resilient to Langfuse downtime (retries with backoff)
+ *
+ * @see https://langfuse.com/docs/tracing
+ * @see https://opencode.ai/docs/plugins/
  */
 
 import type { Plugin } from '@opencode-ai/plugin';
-import { tool } from '@opencode-ai/plugin';
-import path from 'path';
+import { Effect, Fiber } from 'effect';
+
+import { getInvalidPatterns, loadConfig, validateConfig } from './lib/config.js';
+import { logError, logInfo, logWarn } from './lib/logger.js';
+import { initializeRuntime, runEffect, shutdown } from './effect/runtime.js';
+import { EventQueue } from './effect/services/EventQueue.js';
+import { forkEventProcessor } from './effect/streams/EventProcessor.js';
+import type {
+  MessageEvent,
+  MessagePartEvent,
+  PluginEvent,
+  SessionEvent,
+  ToolEvent,
+} from './effect/streams/types.js';
 
 // ============================================================
-// COMMAND LOADER
-// Loads .md files from src/command/ directory as slash commands
+// TYPE DEFINITIONS
+// OpenCode event types (subset needed for this plugin)
 // ============================================================
 
-interface CommandFrontmatter {
-  description?: string;
-  agent?: string;
-  model?: string;
-  subtask?: boolean;
-}
-
-interface ParsedCommand {
-  name: string;
-  frontmatter: CommandFrontmatter;
-  template: string;
-}
-
-/**
- * Parse YAML frontmatter from a markdown file
- * Format:
- * ---
- * description: Command description
- * agent: optional-agent
- * ---
- * Template content here
- */
-function parseFrontmatter(content: string): { frontmatter: CommandFrontmatter; body: string } {
-  const frontmatterRegex = /^---\n([\s\S]*?)\n---\n([\s\S]*)$/;
-  const match = content.match(frontmatterRegex);
-
-  if (!match) {
-    return { frontmatter: {}, body: content.trim() };
-  }
-
-  const [, yamlContent, body] = match;
-  const frontmatter: CommandFrontmatter = {};
-
-  // Simple YAML parsing for key: value pairs
-  for (const line of yamlContent.split('\n')) {
-    const colonIndex = line.indexOf(':');
-    if (colonIndex === -1) continue;
-
-    const key = line.slice(0, colonIndex).trim();
-    const value = line.slice(colonIndex + 1).trim();
-
-    if (key === 'description') frontmatter.description = value;
-    if (key === 'agent') frontmatter.agent = value;
-    if (key === 'model') frontmatter.model = value;
-    if (key === 'subtask') frontmatter.subtask = value === 'true';
-  }
-
-  return { frontmatter, body: body.trim() };
-}
-
-/**
- * Load all command .md files from the command directory
- */
-async function loadCommands(): Promise<ParsedCommand[]> {
-  const commands: ParsedCommand[] = [];
-  const commandDir = path.join(import.meta.dir, 'command');
-  const glob = new Bun.Glob('**/*.md');
-
-  for await (const file of glob.scan({ cwd: commandDir, absolute: true })) {
-    const content = await Bun.file(file).text();
-    const { frontmatter, body } = parseFrontmatter(content);
-
-    // Extract command name from filename (e.g., "hello.md" -> "hello")
-    const relativePath = path.relative(commandDir, file);
-    const name = relativePath.replace(/\.md$/, '').replace(/\//g, '-');
-
-    commands.push({
-      name,
-      frontmatter,
-      template: body,
-    });
-  }
-
-  return commands;
-}
-
-export const ExamplePlugin: Plugin = async () => {
-  // ============================================================
-  // LOAD COMMANDS FROM .MD FILES
-  // Commands are loaded at plugin initialization time
-  // ============================================================
-  const commands = await loadCommands();
-
-  // ============================================================
-  // EXAMPLE TOOL
-  // Tools are callable by the LLM during conversations
-  // ============================================================
-  const exampleTool = tool({
-    description: 'An example tool that echoes back the input message',
-    args: {
-      message: tool.schema.string().describe('The message to echo'),
-    },
-    async execute(args) {
-      return `Echo: ${args.message}`;
-    },
-  });
-
-  return {
-    // Register custom tools
-    tool: {
-      example_tool: exampleTool,
-    },
-
-    // ============================================================
-    // CONFIG HOOK
-    // Modify config at runtime - use this to inject custom commands
-    // ============================================================
-    async config(config) {
-      // Initialize the command record if it doesn't exist
-      config.command = config.command ?? {};
-
-      // Register all loaded commands
-      for (const cmd of commands) {
-        config.command[cmd.name] = {
-          template: cmd.template,
-          description: cmd.frontmatter.description,
-          agent: cmd.frontmatter.agent,
-          model: cmd.frontmatter.model,
-          subtask: cmd.frontmatter.subtask,
-        };
-      }
-    },
+interface Session {
+  id: string;
+  title: string;
+  time: {
+    created: number;
+    updated: number;
   };
+}
+
+interface AssistantMessage {
+  id: string;
+  sessionID: string;
+  role: 'assistant';
+  parentID: string;
+  modelID: string;
+  providerID: string;
+  cost: number;
+  tokens: {
+    input: number;
+    output: number;
+    reasoning: number;
+    cache: { read: number; write: number };
+  };
+  time: {
+    created: number;
+    completed?: number;
+  };
+}
+
+interface UserMessage {
+  id: string;
+  sessionID: string;
+  role: 'user';
+  time: { created: number };
+}
+
+type Message = UserMessage | AssistantMessage;
+
+interface TextPart {
+  id: string;
+  sessionID: string;
+  messageID: string;
+  type: 'text';
+  text: string;
+  time?: { start: number; end?: number };
+}
+
+interface ToolPartState {
+  status: 'pending' | 'running' | 'completed' | 'error';
+  input: object;
+  output?: string;
+  title?: string;
+  time?: { start: number; end?: number };
+  error?: string;
+}
+
+interface ToolPart {
+  id: string;
+  sessionID: string;
+  messageID: string;
+  type: 'tool';
+  callID: string;
+  tool: string;
+  state: ToolPartState;
+}
+
+type Part = TextPart | ToolPart | { type: string; [key: string]: unknown };
+
+interface Event {
+  type: string;
+  properties: Record<string, unknown>;
+}
+
+// ============================================================
+// EVENT CONVERSION
+// Convert OpenCode events to our Effect stream types
+// ============================================================
+
+function convertSessionEvent(
+  eventType: 'session.created' | 'session.updated' | 'session.delete',
+  session: Session
+): SessionEvent {
+  return {
+    type: eventType,
+    eventKey: session.id,
+    timestamp: Date.now(),
+    sessionId: session.id,
+    title: session.title,
+  };
+}
+
+function convertMessageEvent(message: Message): MessageEvent | null {
+  // Only process complete messages
+  if (message.role === 'assistant') {
+    const assistantMsg = message as AssistantMessage;
+    if (!assistantMsg.time.completed) {
+      return null; // Skip incomplete assistant messages
+    }
+
+    return {
+      type: 'message.updated',
+      eventKey: message.id,
+      timestamp: Date.now(),
+      sessionId: message.sessionID,
+      messageId: message.id,
+      role: 'assistant',
+      model: `${assistantMsg.providerID}/${assistantMsg.modelID}`,
+      usage: {
+        promptTokens: assistantMsg.tokens.input,
+        completionTokens: assistantMsg.tokens.output,
+        totalTokens:
+          assistantMsg.tokens.input + assistantMsg.tokens.output + assistantMsg.tokens.reasoning,
+      },
+    };
+  }
+
+  // User messages are always complete
+  return {
+    type: 'message.updated',
+    eventKey: message.id,
+    timestamp: Date.now(),
+    sessionId: message.sessionID,
+    messageId: message.id,
+    role: 'user',
+  };
+}
+
+function convertMessagePartEvent(part: Part): MessagePartEvent | null {
+  if (part.type === 'text') {
+    const textPart = part as TextPart;
+
+    // Only process completed text parts
+    if (!textPart.time?.end || !textPart.text) {
+      return null;
+    }
+
+    return {
+      type: 'message.part.updated',
+      eventKey: textPart.id,
+      timestamp: Date.now(),
+      sessionId: textPart.sessionID,
+      messageId: textPart.messageID,
+      partId: textPart.id,
+      partType: 'text',
+      content: textPart.text,
+    };
+  }
+
+  if (part.type === 'tool') {
+    const toolPart = part as ToolPart;
+
+    // Only process completed or errored tool calls
+    if (toolPart.state.status !== 'completed' && toolPart.state.status !== 'error') {
+      return null;
+    }
+
+    return {
+      type: 'message.part.updated',
+      eventKey: toolPart.id,
+      timestamp: Date.now(),
+      sessionId: toolPart.sessionID,
+      messageId: toolPart.messageID,
+      partId: toolPart.id,
+      partType: toolPart.state.status === 'error' ? 'tool-result' : 'tool-invocation',
+      toolName: toolPart.tool,
+      toolInput: toolPart.state.input,
+      toolOutput: toolPart.state.output,
+    };
+  }
+
+  return null;
+}
+
+function convertToolEvent(
+  eventType: 'tool.execute.before' | 'tool.execute.after',
+  tool: string,
+  sessionId: string,
+  input?: unknown,
+  output?: unknown,
+  error?: string
+): ToolEvent {
+  return {
+    type: eventType,
+    eventKey: `${sessionId}:${tool}:${Date.now()}`,
+    timestamp: Date.now(),
+    sessionId,
+    toolName: tool,
+    toolInput: input,
+    toolOutput: output,
+    error,
+  };
+}
+
+// ============================================================
+// PLUGIN STATE
+// ============================================================
+
+let isInitialized = false;
+let processorFiber: Fiber.RuntimeFiber<void, never> | null = null;
+
+// ============================================================
+// PLUGIN EXPORT
+// ============================================================
+
+export const LangfuseExporterPlugin: Plugin = async () => {
+  try {
+    // Load and validate configuration
+    const pluginConfig = loadConfig();
+    const errors = validateConfig(pluginConfig);
+
+    // Log any invalid redact patterns
+    const invalidPatterns = getInvalidPatterns();
+    for (const pattern of invalidPatterns) {
+      logWarn(`Invalid redact pattern ignored: ${pattern}`);
+    }
+
+    if (errors.length > 0) {
+      for (const error of errors) {
+        logError(new Error(error), 'Configuration error');
+      }
+      logWarn('Plugin disabled due to configuration errors');
+      return {};
+    }
+
+    if (!pluginConfig.enabled) {
+      logInfo('Plugin disabled via configuration');
+      return {};
+    }
+
+    if (pluginConfig.exportMode === 'off') {
+      logInfo('Export mode is off, plugin inactive');
+      return {};
+    }
+
+    // Initialize Effect runtime
+    try {
+      await runEffect(initializeRuntime);
+      isInitialized = true;
+      logInfo('Effect runtime initialized');
+
+      // Fork the event processor to run in background
+      processorFiber = await runEffect(forkEventProcessor);
+      logInfo('Event processor started');
+    } catch (error) {
+      logError(error, 'Failed to initialize Effect runtime');
+      return {};
+    }
+
+    // Register shutdown handler
+    const shutdownHandler = async (): Promise<void> => {
+      try {
+        logInfo('Shutting down Langfuse exporter...');
+
+        // Interrupt the processor fiber
+        if (processorFiber) {
+          await runEffect(Fiber.interrupt(processorFiber));
+          processorFiber = null;
+        }
+
+        // Shutdown the runtime
+        await shutdown();
+        logInfo('Langfuse exporter shutdown complete');
+      } catch (error) {
+        logError(error, 'Error during shutdown');
+      }
+    };
+
+    process.on('beforeExit', shutdownHandler);
+    process.on('SIGINT', async () => {
+      await shutdownHandler();
+      process.exit(0);
+    });
+    process.on('SIGTERM', async () => {
+      await shutdownHandler();
+      process.exit(0);
+    });
+
+    /**
+     * Queue an event for processing.
+     * This is non-blocking - events are processed asynchronously with debounce.
+     */
+    const queueEvent = async (event: PluginEvent): Promise<void> => {
+      if (!isInitialized) return;
+
+      try {
+        await runEffect(
+          Effect.gen(function* () {
+            const queue = yield* EventQueue;
+            yield* queue.offer(event);
+          })
+        );
+      } catch (error) {
+        logError(error, 'Failed to queue event');
+      }
+    };
+
+    return {
+      // Main event hook - handles all OpenCode events
+      async event({ event }: { event: Event }): Promise<void> {
+        if (!isInitialized) return;
+
+        try {
+          switch (event.type) {
+            case 'session.created': {
+              const session = (event.properties as { info: Session }).info;
+              await queueEvent(convertSessionEvent('session.created', session));
+              break;
+            }
+
+            case 'session.updated': {
+              const session = (event.properties as { info: Session }).info;
+              await queueEvent(convertSessionEvent('session.updated', session));
+              break;
+            }
+
+            case 'session.delete': {
+              const session = (event.properties as { info: Session }).info;
+              await queueEvent(convertSessionEvent('session.delete', session));
+              break;
+            }
+
+            case 'message.updated': {
+              const message = (event.properties as { info: Message }).info;
+              const converted = convertMessageEvent(message);
+              if (converted) {
+                await queueEvent(converted);
+              }
+              break;
+            }
+
+            case 'message.part.updated': {
+              const part = (event.properties as { part: Part }).part;
+              const converted = convertMessagePartEvent(part);
+              if (converted) {
+                await queueEvent(converted);
+              }
+              break;
+            }
+
+            // Silently ignore other events
+            default:
+              break;
+          }
+        } catch (error) {
+          logError(error, `Error handling event ${event.type}`);
+        }
+      },
+
+      // Tool execution hooks for more precise timing
+      async 'tool.execute.before'(
+        input: { tool: string; sessionID: string; callID: string },
+        _output: { args: unknown }
+      ): Promise<void> {
+        if (!isInitialized) return;
+
+        await queueEvent(
+          convertToolEvent('tool.execute.before', input.tool, input.sessionID, _output.args)
+        );
+      },
+
+      async 'tool.execute.after'(
+        input: { tool: string; sessionID: string; callID: string },
+        output: { title: string; output: string; metadata: unknown }
+      ): Promise<void> {
+        if (!isInitialized) return;
+
+        await queueEvent(
+          convertToolEvent(
+            'tool.execute.after',
+            input.tool,
+            input.sessionID,
+            undefined,
+            output.output
+          )
+        );
+      },
+    };
+  } catch (error) {
+    logError(error, 'Fatal error initializing plugin');
+    return {};
+  }
 };
+
+// Default export for OpenCode plugin loader
+export default LangfuseExporterPlugin;

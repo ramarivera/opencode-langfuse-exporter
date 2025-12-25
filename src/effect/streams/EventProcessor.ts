@@ -1,0 +1,434 @@
+/**
+ * EventProcessor - Main stream pipeline for processing OpenCode events.
+ *
+ * This is the core of the fix for duplicate observations. It uses a
+ * debounce-based approach with state tracking to consolidate streaming
+ * events into final observations.
+ *
+ * Strategy:
+ * 1. Events come in through the queue
+ * 2. For each event key, we track the latest event and a timeout
+ * 3. When no updates arrive for 10s, we process the final state
+ * 4. ProcessedIds prevents re-processing the same event
+ */
+
+import { Effect, Fiber, HashMap, Option, Ref, Stream } from 'effect';
+
+import { DEBOUNCE_DURATION } from '../constants.js';
+import { EventQueue } from '../services/EventQueue.js';
+import { ProcessedIds } from '../services/ProcessedIds.js';
+import { SessionState } from '../services/SessionState.js';
+import { LangfuseClient } from '../services/LangfuseClient.js';
+import { getEventKey, type PluginEvent, type TraceState } from './types.js';
+import { redactObject, redactText } from '../../lib/redaction.js';
+import { sessionToUUID } from '../../lib/session-id.js';
+
+/**
+ * State for tracking pending events and their debounce timers.
+ */
+interface DebounceState {
+  /** Latest event for each key */
+  readonly events: HashMap.HashMap<string, PluginEvent>;
+  /** Debounce timers (fibers) for each key */
+  readonly timers: HashMap.HashMap<string, Fiber.RuntimeFiber<void, never>>;
+}
+
+/**
+ * Create the main event processing stream.
+ */
+export const createEventProcessor = Effect.gen(function* () {
+  const eventQueue = yield* EventQueue;
+  const processedIds = yield* ProcessedIds;
+  const sessionState = yield* SessionState;
+  const langfuseClient = yield* LangfuseClient;
+
+  // Get redaction config
+  const config = langfuseClient.config;
+  const redactPatterns = config.redactPatterns;
+
+  // Debounce state
+  const stateRef = yield* Ref.make<DebounceState>({
+    events: HashMap.empty(),
+    timers: HashMap.empty(),
+  });
+
+  /**
+   * Apply redaction to content.
+   */
+  const applyRedaction = (content: string | undefined): string | undefined => {
+    if (!content) return content;
+    if (config.exportMode === 'metadata_only') return '[REDACTED]';
+    return redactText(content, redactPatterns);
+  };
+
+  /**
+   * Apply redaction to objects.
+   */
+  const applyObjectRedaction = <T>(obj: T): T => {
+    if (!obj) return obj;
+    if (config.exportMode === 'metadata_only') return '[REDACTED]' as T;
+    return redactObject(obj, redactPatterns) as T;
+  };
+
+  /**
+   * Process a single event (called after debounce).
+   */
+  const processEvent = (event: PluginEvent): Effect.Effect<void, never, never> =>
+    Effect.gen(function* () {
+      const eventKey = getEventKey(event);
+
+      // Check if already processed
+      const isNew = yield* processedIds.add(eventKey);
+      if (!isNew) {
+        yield* Effect.logDebug('Event already processed, skipping', { eventKey });
+        return;
+      }
+
+      yield* Effect.logDebug('Processing event', {
+        type: event.type,
+        eventKey,
+        sessionId: event.sessionId,
+      });
+
+      // Handle event based on type
+      if (event.type === 'session.created' || event.type === 'session.updated') {
+        const title = 'title' in event ? (event.title as string | undefined) : undefined;
+        yield* handleSessionEvent(
+          event.sessionId,
+          event.type,
+          title,
+          sessionState,
+          langfuseClient,
+          applyRedaction
+        );
+      } else if (event.type === 'session.delete') {
+        yield* handleSessionDelete(event.sessionId, sessionState, langfuseClient);
+      } else if (event.type === 'message.updated') {
+        yield* handleMessageEvent(
+          event.sessionId,
+          event.role,
+          event.content,
+          event.model,
+          event.usage,
+          sessionState,
+          langfuseClient,
+          applyRedaction
+        );
+      } else if (event.type === 'message.part.updated') {
+        yield* handleMessagePartEvent(
+          event.sessionId,
+          event.partType,
+          event.toolName,
+          event.toolInput,
+          event.toolOutput,
+          sessionState,
+          langfuseClient,
+          applyObjectRedaction
+        );
+      } else if (event.type === 'tool.execute.before' || event.type === 'tool.execute.after') {
+        yield* handleToolEvent(
+          event.sessionId,
+          event.type,
+          event.toolName,
+          event.toolInput,
+          event.toolOutput,
+          event.error,
+          sessionState,
+          langfuseClient,
+          applyRedaction,
+          applyObjectRedaction
+        );
+      }
+    }).pipe(
+      Effect.catchAllCause((cause) =>
+        Effect.logError('Error processing event', {
+          eventKey: getEventKey(event),
+          cause: String(cause),
+        })
+      )
+    );
+
+  /**
+   * Schedule processing for an event after debounce duration.
+   */
+  const scheduleProcessing = (eventKey: string): Effect.Effect<void, never, never> =>
+    Effect.gen(function* () {
+      // Wait for debounce duration
+      yield* Effect.sleep(DEBOUNCE_DURATION);
+
+      // Get and remove the event from state
+      const state = yield* Ref.get(stateRef);
+      const maybeEvent = HashMap.get(state.events, eventKey);
+
+      if (Option.isNone(maybeEvent)) {
+        return;
+      }
+
+      // Remove from state
+      yield* Ref.update(stateRef, (s) => ({
+        events: HashMap.remove(s.events, eventKey),
+        timers: HashMap.remove(s.timers, eventKey),
+      }));
+
+      // Process the event
+      yield* processEvent(maybeEvent.value);
+    });
+
+  /**
+   * Handle an incoming event - update state and reset debounce timer.
+   */
+  const handleIncomingEvent = (event: PluginEvent): Effect.Effect<void, never, never> =>
+    Effect.gen(function* () {
+      const eventKey = getEventKey(event);
+
+      // Get current state
+      const state = yield* Ref.get(stateRef);
+
+      // Cancel existing timer if any
+      const existingTimer = HashMap.get(state.timers, eventKey);
+      if (Option.isSome(existingTimer)) {
+        yield* Fiber.interrupt(existingTimer.value);
+      }
+
+      // Start new timer
+      const timerFiber = yield* Effect.fork(scheduleProcessing(eventKey));
+
+      // Update state with new event and timer
+      yield* Ref.set(stateRef, {
+        events: HashMap.set(state.events, eventKey, event),
+        timers: HashMap.set(state.timers, eventKey, timerFiber),
+      });
+    });
+
+  /**
+   * Create a stream that consumes from the queue and processes events.
+   */
+  const processingStream = Stream.fromQueue(eventQueue.queue).pipe(
+    Stream.tap((event) =>
+      Effect.logDebug('Event received', {
+        type: event.type,
+        eventKey: getEventKey(event),
+      })
+    ),
+    Stream.mapEffect((event) => handleIncomingEvent(event))
+  );
+
+  return processingStream;
+});
+
+/**
+ * Handle session.created and session.updated events.
+ */
+function handleSessionEvent(
+  sessionId: string,
+  eventType: 'session.created' | 'session.updated',
+  title: string | undefined,
+  sessionState: SessionState,
+  langfuseClient: LangfuseClient,
+  applyRedaction: (s: string | undefined) => string | undefined
+): Effect.Effect<void, never, never> {
+  return Effect.gen(function* () {
+    const traceId = sessionToUUID(sessionId);
+
+    const existing = yield* sessionState.get(sessionId);
+
+    if (!existing) {
+      const traceState: TraceState = {
+        traceId,
+        sessionId,
+        title: title || 'OpenCode Session',
+        createdAt: Date.now(),
+        generations: new Map(),
+        spans: new Map(),
+      };
+      yield* sessionState.set(sessionId, traceState);
+
+      yield* langfuseClient
+        .createTrace({
+          id: traceId,
+          sessionId,
+          name: applyRedaction(traceState.title) || 'OpenCode Session',
+        })
+        .pipe(Effect.catchAll(() => Effect.void));
+    } else if (eventType === 'session.updated' && title) {
+      yield* sessionState.update(sessionId, (state) => ({
+        ...state,
+        title: title || state.title,
+      }));
+    }
+  });
+}
+
+/**
+ * Handle session.delete event.
+ */
+function handleSessionDelete(
+  sessionId: string,
+  sessionState: SessionState,
+  langfuseClient: LangfuseClient
+): Effect.Effect<void, never, never> {
+  return Effect.gen(function* () {
+    yield* langfuseClient.flush.pipe(Effect.catchAll(() => Effect.void));
+    yield* sessionState.delete(sessionId);
+  });
+}
+
+/**
+ * Handle message.updated events.
+ */
+function handleMessageEvent(
+  sessionId: string,
+  role: 'user' | 'assistant',
+  content: string | undefined,
+  model: string | undefined,
+  usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | undefined,
+  sessionState: SessionState,
+  langfuseClient: LangfuseClient,
+  applyRedaction: (s: string | undefined) => string | undefined
+): Effect.Effect<void, never, never> {
+  return Effect.gen(function* () {
+    const state = yield* sessionState.get(sessionId);
+    if (!state) {
+      yield* Effect.logWarning('No session state for message', { sessionId });
+      return;
+    }
+
+    if (role === 'user') {
+      yield* langfuseClient
+        .createSpan({
+          traceId: state.traceId,
+          name: 'user-message',
+          input: applyRedaction(content),
+        })
+        .pipe(Effect.catchAll(() => Effect.void));
+    } else {
+      yield* langfuseClient
+        .createGeneration({
+          traceId: state.traceId,
+          name: 'assistant-response',
+          model,
+          output: applyRedaction(content),
+          usage: usage
+            ? {
+                input: usage.promptTokens,
+                output: usage.completionTokens,
+                total: usage.totalTokens,
+              }
+            : undefined,
+        })
+        .pipe(Effect.catchAll(() => Effect.void));
+    }
+  });
+}
+
+/**
+ * Handle message.part.updated events.
+ */
+function handleMessagePartEvent(
+  sessionId: string,
+  partType: 'text' | 'tool-invocation' | 'tool-result',
+  toolName: string | undefined,
+  toolInput: unknown,
+  toolOutput: unknown,
+  sessionState: SessionState,
+  langfuseClient: LangfuseClient,
+  applyObjectRedaction: <T>(obj: T) => T
+): Effect.Effect<void, never, never> {
+  return Effect.gen(function* () {
+    const state = yield* sessionState.get(sessionId);
+    if (!state) {
+      yield* Effect.logWarning('No session state for message part', { sessionId });
+      return;
+    }
+
+    if (partType === 'text') {
+      // Text parts are captured via message.updated
+      return;
+    }
+
+    if (partType === 'tool-invocation') {
+      yield* langfuseClient
+        .createSpan({
+          traceId: state.traceId,
+          name: `tool-${toolName || 'unknown'}`,
+          input: applyObjectRedaction(toolInput),
+          startTime: new Date(),
+        })
+        .pipe(Effect.catchAll(() => Effect.void));
+    } else if (partType === 'tool-result') {
+      yield* langfuseClient
+        .createSpan({
+          traceId: state.traceId,
+          name: `tool-${toolName || 'unknown'}-result`,
+          output: applyObjectRedaction(toolOutput),
+          endTime: new Date(),
+        })
+        .pipe(Effect.catchAll(() => Effect.void));
+    }
+  });
+}
+
+/**
+ * Handle tool.execute.before and tool.execute.after events.
+ */
+function handleToolEvent(
+  sessionId: string,
+  eventType: 'tool.execute.before' | 'tool.execute.after',
+  toolName: string,
+  toolInput: unknown,
+  toolOutput: unknown,
+  error: string | undefined,
+  sessionState: SessionState,
+  langfuseClient: LangfuseClient,
+  applyRedaction: (s: string | undefined) => string | undefined,
+  applyObjectRedaction: <T>(obj: T) => T
+): Effect.Effect<void, never, never> {
+  return Effect.gen(function* () {
+    const state = yield* sessionState.get(sessionId);
+    if (!state) {
+      yield* Effect.logWarning('No session state for tool event', { sessionId });
+      return;
+    }
+
+    if (eventType === 'tool.execute.before') {
+      yield* langfuseClient
+        .createSpan({
+          traceId: state.traceId,
+          name: `tool-${toolName}`,
+          input: applyObjectRedaction(toolInput),
+          startTime: new Date(),
+        })
+        .pipe(Effect.catchAll(() => Effect.void));
+    } else {
+      const metadata = error ? { error: applyRedaction(error) || null } : undefined;
+      yield* langfuseClient
+        .createSpan({
+          traceId: state.traceId,
+          name: `tool-${toolName}`,
+          output: applyObjectRedaction(toolOutput),
+          endTime: new Date(),
+          metadata,
+        })
+        .pipe(Effect.catchAll(() => Effect.void));
+    }
+  });
+}
+
+/**
+ * Run the event processor stream.
+ */
+export const runEventProcessor = Effect.gen(function* () {
+  const stream = yield* createEventProcessor;
+  yield* Effect.logInfo('Starting event processor stream');
+  yield* Stream.runDrain(stream);
+});
+
+/**
+ * Fork the event processor to run in the background.
+ */
+export const forkEventProcessor = Effect.gen(function* () {
+  const stream = yield* createEventProcessor;
+  yield* Effect.logInfo('Forking event processor stream');
+  const fiber = yield* Stream.runDrain(stream).pipe(Effect.fork);
+  return fiber;
+});
