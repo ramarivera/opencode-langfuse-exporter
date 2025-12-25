@@ -4,7 +4,7 @@
  * This module sets up the Effect runtime with all required services.
  */
 
-import { Effect, Layer, ManagedRuntime } from 'effect';
+import { Effect, Fiber, Layer, ManagedRuntime } from 'effect';
 
 // Import services (will be implemented in services/)
 import { EventQueueLive, type EventQueue } from './services/EventQueue.js';
@@ -88,6 +88,24 @@ export function runEffectFork<A, E>(effect: Effect.Effect<A, E, PluginContext>):
   runtime.runFork(
     effect.pipe(Effect.catchAll((error) => Effect.logError('Effect failed', { error })))
   );
+}
+
+/**
+ * Fork an effect as a daemon fiber using the plugin runtime.
+ *
+ * IMPORTANT: This uses runtime.runFork directly, which creates a true daemon
+ * fiber that persists across multiple runPromise calls. This is required for
+ * long-running background tasks like the event processor stream.
+ *
+ * Using runEffect(Effect.fork(...)) would NOT work because the forked fiber's
+ * parent context terminates when runPromise completes, preventing the fiber
+ * from receiving queue events offered in subsequent runPromise calls.
+ */
+export function forkDaemon<A, E>(
+  effect: Effect.Effect<A, E, PluginContext>
+): Fiber.RuntimeFiber<A, E | PluginError> {
+  const runtime = getRuntime();
+  return runtime.runFork(effect);
 }
 
 /**
