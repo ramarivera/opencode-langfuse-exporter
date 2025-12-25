@@ -23,6 +23,7 @@ import { forkDaemon, initializeRuntime, runEffect, shutdown } from './effect/run
 import { EventQueue } from './effect/services/EventQueue.js';
 import { runEventProcessor } from './effect/streams/EventProcessor.js';
 import type {
+  ChatParamsEvent,
   MessageEvent,
   MessagePartEvent,
   PluginEvent,
@@ -231,6 +232,38 @@ function convertMessagePartEvent(part: Part): MessagePartEvent | null {
 // NOTE: convertToolEvent removed - tool.execute hooks not used anymore
 // We get complete tool data from message.part.updated events
 
+/**
+ * Convert chat.params hook input to ChatParamsEvent.
+ */
+function convertChatParamsEvent(
+  sessionId: string,
+  params: {
+    temperature?: number;
+    topP?: number;
+    topK?: number;
+    maxTokens?: number;
+    frequencyPenalty?: number;
+    presencePenalty?: number;
+    stop?: string[];
+  }
+): ChatParamsEvent {
+  return {
+    type: 'chat.params',
+    eventKey: `${sessionId}:chat.params:${Date.now()}`,
+    timestamp: Date.now(),
+    sessionId,
+    params: {
+      temperature: params.temperature,
+      topP: params.topP,
+      topK: params.topK,
+      maxTokens: params.maxTokens,
+      frequencyPenalty: params.frequencyPenalty,
+      presencePenalty: params.presencePenalty,
+      stop: params.stop,
+    },
+  };
+}
+
 // ============================================================
 // PLUGIN STATE
 // ============================================================
@@ -396,6 +429,32 @@ export const LangfuseExporterPlugin: Plugin = async () => {
 
       // NOTE: tool.execute.before/after hooks removed - we get complete tool data
       // from message.part.updated events which include both input AND output
+
+      /**
+       * Capture model parameters before LLM call.
+       * The chat.params hook is called just before the LLM request is made.
+       */
+      async 'chat.params'(
+        input: {
+          sessionID: string;
+          temperature?: number;
+          topP?: number;
+          topK?: number;
+          maxTokens?: number;
+          frequencyPenalty?: number;
+          presencePenalty?: number;
+          stop?: string[];
+        },
+        _output: Record<string, unknown>
+      ): Promise<void> {
+        if (!isInitialized) return;
+
+        try {
+          await queueEvent(convertChatParamsEvent(input.sessionID, input));
+        } catch (error) {
+          logError(error, 'Error handling chat.params hook');
+        }
+      },
     };
   } catch (error) {
     logError(error, 'Fatal error initializing plugin');

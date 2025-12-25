@@ -19,7 +19,7 @@ import { EventQueue } from '../services/EventQueue.js';
 import { ProcessedIds } from '../services/ProcessedIds.js';
 import { SessionState } from '../services/SessionState.js';
 import { LangfuseClient } from '../services/LangfuseClient.js';
-import { getEventKey, type PluginEvent, type TraceState } from './types.js';
+import { getEventKey, type ModelParams, type PluginEvent, type TraceState } from './types.js';
 import { redactObject, redactText } from '../../lib/redaction.js';
 import { sessionToUUID } from '../../lib/session-id.js';
 
@@ -143,6 +143,8 @@ export const createEventProcessor = Effect.gen(function* () {
           applyRedaction,
           applyObjectRedaction
         );
+      } else if (event.type === 'chat.params') {
+        yield* handleChatParamsEvent(event.sessionId, event.params, sessionState);
       }
     }).pipe(
       Effect.catchAllCause((cause) =>
@@ -184,6 +186,7 @@ export const createEventProcessor = Effect.gen(function* () {
    *
    * - Session events: must be immediate so message events have session state
    * - Message events: must be immediate so message.part events have message info
+   * - Chat params: must be immediate so params are stored before generation is created
    * - Only message.part events are debounced (to consolidate streaming text)
    */
   const shouldProcessImmediately = (event: PluginEvent): boolean => {
@@ -191,7 +194,8 @@ export const createEventProcessor = Effect.gen(function* () {
       event.type === 'session.created' ||
       event.type === 'session.updated' ||
       event.type === 'session.delete' ||
-      event.type === 'message.updated'
+      event.type === 'message.updated' ||
+      event.type === 'chat.params'
     );
   };
 
@@ -249,6 +253,31 @@ export const createEventProcessor = Effect.gen(function* () {
 
   return processingStream;
 });
+
+/**
+ * Handle chat.params event - store model parameters for the next generation.
+ */
+function handleChatParamsEvent(
+  sessionId: string,
+  params: ModelParams,
+  sessionState: SessionState
+): Effect.Effect<void, never, never> {
+  return Effect.gen(function* () {
+    const existing = yield* sessionState.get(sessionId);
+    if (!existing) {
+      yield* Effect.logWarning('No session state for chat.params', { sessionId });
+      return;
+    }
+
+    // Store params as pending for the next generation
+    yield* sessionState.update(sessionId, (state) => ({
+      ...state,
+      pendingModelParams: params,
+    }));
+
+    yield* Effect.logDebug('Stored pending model params', { sessionId, params });
+  });
+}
 
 /**
  * Handle session.created and session.updated events.
@@ -406,6 +435,23 @@ function handleMessageEvent(
       const startTime = time?.created ? new Date(time.created) : undefined;
       const endTime = time?.completed ? new Date(time.completed) : undefined;
 
+      // Build modelParameters from pending params (captured via chat.params hook)
+      let modelParameters: Record<string, string | number | boolean | null> | undefined;
+      if (state.pendingModelParams) {
+        const params = state.pendingModelParams;
+        modelParameters = {};
+        if (params.temperature !== undefined) modelParameters.temperature = params.temperature;
+        if (params.topP !== undefined) modelParameters.top_p = params.topP;
+        if (params.topK !== undefined) modelParameters.top_k = params.topK;
+        if (params.maxTokens !== undefined) modelParameters.max_tokens = params.maxTokens;
+        if (params.frequencyPenalty !== undefined)
+          modelParameters.frequency_penalty = params.frequencyPenalty;
+        if (params.presencePenalty !== undefined)
+          modelParameters.presence_penalty = params.presencePenalty;
+        if (params.stop !== undefined && params.stop.length > 0)
+          modelParameters.stop = params.stop.join(',');
+      }
+
       yield* langfuseClient
         .createGeneration({
           id: observationId,
@@ -413,6 +459,10 @@ function handleMessageEvent(
           parentObservationId,
           name: 'assistant-response',
           model,
+          modelParameters:
+            modelParameters && Object.keys(modelParameters).length > 0
+              ? modelParameters
+              : undefined,
           usageDetails: Object.keys(usageDetails).length > 0 ? usageDetails : undefined,
           costDetails,
           startTime,
@@ -421,12 +471,13 @@ function handleMessageEvent(
         .pipe(Effect.catchAll(() => Effect.void));
     }
 
-    // Register message in state for later part lookups (include parentObservationId for threading)
+    // Register message in state and clear pending model params (they've been consumed)
     const newMessages = new Map(state.messages);
     newMessages.set(messageId, { observationId, role, model, parentObservationId });
     yield* sessionState.update(sessionId, (s) => ({
       ...s,
       messages: newMessages,
+      pendingModelParams: undefined, // Clear after consumption
     }));
   });
 }

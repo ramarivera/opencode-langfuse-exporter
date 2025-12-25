@@ -83,9 +83,35 @@ export interface ToolEvent extends BasePluginEvent {
 }
 
 /**
+ * Model parameters captured from chat.params hook.
+ */
+export interface ModelParams {
+  readonly temperature?: number;
+  readonly topP?: number;
+  readonly topK?: number;
+  readonly maxTokens?: number;
+  readonly frequencyPenalty?: number;
+  readonly presencePenalty?: number;
+  readonly stop?: readonly string[];
+}
+
+/**
+ * Chat params event - captures model parameters before LLM call.
+ */
+export interface ChatParamsEvent extends BasePluginEvent {
+  readonly type: 'chat.params';
+  readonly params: ModelParams;
+}
+
+/**
  * Union type of all events that flow through the stream.
  */
-export type PluginEvent = SessionEvent | MessageEvent | MessagePartEvent | ToolEvent;
+export type PluginEvent =
+  | SessionEvent
+  | MessageEvent
+  | MessagePartEvent
+  | ToolEvent
+  | ChatParamsEvent;
 
 /**
  * Extract the event key used for grouping and deduplication.
@@ -139,4 +165,6 @@ export interface TraceState {
   readonly messages: Map<string, MessageInfo>;
   /** Active span IDs (partId/toolKey -> spanId) */
   readonly spans: Map<string, string>;
+  /** Model parameters captured from chat.params hook (pending for next generation) */
+  readonly pendingModelParams?: ModelParams;
 }
