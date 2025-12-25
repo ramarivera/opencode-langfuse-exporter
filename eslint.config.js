@@ -37,7 +37,15 @@ export default tseslint.config(
       'prettier/prettier': 'error',
       '@typescript-eslint/explicit-function-return-type': 'off',
       '@typescript-eslint/no-explicit-any': 'warn',
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        { argsIgnorePattern: '^_', varsIgnorePattern: '^_' },
+      ],
+      'no-unused-vars': 'off',
       'no-console': 'error',
+      // Effect uses same name for interface and Context.Tag - this is intentional
+      'no-redeclare': 'off',
+      '@typescript-eslint/no-redeclare': 'off',
     },
   }
 );

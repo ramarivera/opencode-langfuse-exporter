@@ -5,9 +5,17 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "strict": true,
-    "noEmit": true,
+    "declaration": true,
+    "declarationMap": true,
+    "emitDeclarationOnly": true,
+    "outDir": "./dist",
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
-    "types": ["bun-types"]
-  }
+    "noEmit": false,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "types": ["bun-types", "node"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
 }
