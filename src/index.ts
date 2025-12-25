@@ -141,11 +141,25 @@ function convertMessageEvent(message: Message): MessageEvent | null {
       messageId: message.id,
       role: 'assistant',
       model: `${assistantMsg.providerID}/${assistantMsg.modelID}`,
+      // Parent message ID for conversation threading
+      parentId: assistantMsg.parentID,
+      // Cost in USD
+      cost: assistantMsg.cost,
+      // Timing for accurate duration tracking
+      time: {
+        created: assistantMsg.time.created,
+        completed: assistantMsg.time.completed,
+      },
       usage: {
         promptTokens: assistantMsg.tokens.input,
         completionTokens: assistantMsg.tokens.output,
         totalTokens:
           assistantMsg.tokens.input + assistantMsg.tokens.output + assistantMsg.tokens.reasoning,
+        // Reasoning tokens (for o1, thinking models)
+        reasoningTokens: assistantMsg.tokens.reasoning,
+        // Cache tokens
+        cacheReadTokens: assistantMsg.tokens.cache.read,
+        cacheWriteTokens: assistantMsg.tokens.cache.write,
       },
     };
   }

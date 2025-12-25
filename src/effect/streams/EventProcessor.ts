@@ -110,6 +110,9 @@ export const createEventProcessor = Effect.gen(function* () {
           event.role,
           event.model,
           event.usage,
+          event.parentId,
+          event.cost,
+          event.time,
           sessionState,
           langfuseClient
         );
@@ -316,7 +319,19 @@ function handleMessageEvent(
   messageId: string,
   role: 'user' | 'assistant',
   model: string | undefined,
-  usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | undefined,
+  usage:
+    | {
+        promptTokens?: number;
+        completionTokens?: number;
+        totalTokens?: number;
+        reasoningTokens?: number;
+        cacheReadTokens?: number;
+        cacheWriteTokens?: number;
+      }
+    | undefined,
+  parentId: string | undefined,
+  cost: number | undefined,
+  time: { created: number; completed?: number } | undefined,
   sessionState: SessionState,
   langfuseClient: LangfuseClient
 ): Effect.Effect<void, never, never> {
@@ -336,36 +351,69 @@ function handleMessageEvent(
     // Generate a unique observation ID for this message
     const observationId = `${messageId}-${Date.now()}`;
 
+    // Resolve parent observation ID from parent message ID
+    let parentObservationId: string | undefined;
+    if (parentId) {
+      const parentInfo = state.messages.get(parentId);
+      if (parentInfo) {
+        parentObservationId = parentInfo.observationId;
+      }
+    }
+
     // Create the appropriate Langfuse observation
     if (role === 'user') {
       yield* langfuseClient
         .createSpan({
           id: observationId,
           traceId: state.traceId,
+          parentObservationId,
           name: 'user-message',
         })
         .pipe(Effect.catchAll(() => Effect.void));
     } else {
+      // Build usageDetails with all token types
+      const usageDetails: Record<string, number> = {};
+      if (usage) {
+        if (usage.promptTokens !== undefined) usageDetails.input = usage.promptTokens;
+        if (usage.completionTokens !== undefined) usageDetails.output = usage.completionTokens;
+        if (usage.totalTokens !== undefined) usageDetails.total = usage.totalTokens;
+        if (usage.reasoningTokens !== undefined && usage.reasoningTokens > 0) {
+          usageDetails.reasoning = usage.reasoningTokens;
+        }
+        if (usage.cacheReadTokens !== undefined && usage.cacheReadTokens > 0) {
+          usageDetails.cache_read = usage.cacheReadTokens;
+        }
+        if (usage.cacheWriteTokens !== undefined && usage.cacheWriteTokens > 0) {
+          usageDetails.cache_write = usage.cacheWriteTokens;
+        }
+      }
+
+      // Build costDetails
+      const costDetails: Record<string, number> | undefined =
+        cost !== undefined && cost > 0 ? { total: cost } : undefined;
+
+      // Convert timestamps to Date objects
+      const startTime = time?.created ? new Date(time.created) : undefined;
+      const endTime = time?.completed ? new Date(time.completed) : undefined;
+
       yield* langfuseClient
         .createGeneration({
           id: observationId,
           traceId: state.traceId,
+          parentObservationId,
           name: 'assistant-response',
           model,
-          usage: usage
-            ? {
-                input: usage.promptTokens,
-                output: usage.completionTokens,
-                total: usage.totalTokens,
-              }
-            : undefined,
+          usageDetails: Object.keys(usageDetails).length > 0 ? usageDetails : undefined,
+          costDetails,
+          startTime,
+          endTime,
         })
         .pipe(Effect.catchAll(() => Effect.void));
     }
 
-    // Register message in state for later part lookups
+    // Register message in state for later part lookups (include parentObservationId for threading)
     const newMessages = new Map(state.messages);
-    newMessages.set(messageId, { observationId, role, model });
+    newMessages.set(messageId, { observationId, role, model, parentObservationId });
     yield* sessionState.update(sessionId, (s) => ({
       ...s,
       messages: newMessages,

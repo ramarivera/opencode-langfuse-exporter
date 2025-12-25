@@ -34,10 +34,24 @@ export interface MessageEvent extends BasePluginEvent {
   readonly role: 'user' | 'assistant';
   readonly content?: string;
   readonly model?: string;
+  /** Parent message ID for conversation threading */
+  readonly parentId?: string;
+  /** Cost in USD */
+  readonly cost?: number;
+  /** Timing information */
+  readonly time?: {
+    readonly created: number;
+    readonly completed?: number;
+  };
   readonly usage?: {
     readonly promptTokens?: number;
     readonly completionTokens?: number;
     readonly totalTokens?: number;
+    /** Reasoning tokens (for o1, etc.) */
+    readonly reasoningTokens?: number;
+    /** Cache tokens */
+    readonly cacheReadTokens?: number;
+    readonly cacheWriteTokens?: number;
   };
 }
 
@@ -105,6 +119,8 @@ export interface MessageInfo {
   readonly role: 'user' | 'assistant';
   /** Model used (for assistant messages) */
   readonly model?: string;
+  /** Parent observation ID for threading (from previous message) */
+  readonly parentObservationId?: string;
 }
 
 /**

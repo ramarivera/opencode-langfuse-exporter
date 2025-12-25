@@ -32,11 +32,22 @@ export interface GenerationData {
   modelParameters?: Record<string, string | number | boolean | null>;
   input?: unknown;
   output?: unknown;
+  /** @deprecated Use usageDetails instead */
   usage?: {
     input?: number;
     output?: number;
     total?: number;
   };
+  /**
+   * Detailed usage metrics (tokens).
+   * Keys: input, output, total, reasoning, cache_read, cache_write, etc.
+   */
+  usageDetails?: Record<string, number>;
+  /**
+   * Cost details in USD.
+   * Keys: total, input, output, etc.
+   */
+  costDetails?: Record<string, number>;
   metadata?: Record<string, string | number | boolean | string[] | null>;
   startTime?: Date;
   endTime?: Date;
@@ -245,6 +256,8 @@ export const LangfuseClientLive = Layer.effect(
             input: data.input,
             output: data.output,
             usage: data.usage,
+            usageDetails: data.usageDetails,
+            costDetails: data.costDetails,
             metadata: data.metadata,
             startTime: data.startTime,
             endTime: data.endTime,
